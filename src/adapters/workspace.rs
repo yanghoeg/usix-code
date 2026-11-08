@@ -4,6 +4,33 @@ use anyhow::{ensure, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+// 프로젝트 규칙이 8K 컨텍스트를 잠식하지 않도록 상한을 둔다.
+const MAX_RULES_BYTES: usize = 4 * 1024;
+
+/// 작업 폴더 루트의 AGENTS.md — 없거나 읽을 수 없으면 None.
+pub fn project_rules(workspace: &Path) -> Option<String> {
+    let path = workspace.join("AGENTS.md");
+    if !std::fs::metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(std::fs::File::open(path).ok()?, MAX_RULES_BYTES as u64 + 1),
+        &mut bytes,
+    )
+    .ok()?;
+    let truncated = bytes.len() > MAX_RULES_BYTES;
+    bytes.truncate(MAX_RULES_BYTES);
+    let mut text = String::from_utf8_lossy(&bytes).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    if truncated {
+        text.push_str("\n…(AGENTS.md truncated)");
+    }
+    Some(text)
+}
+
 pub fn tools(tools: Vec<Box<dyn Tool>>, workspace: &Path) -> Vec<Box<dyn Tool>> {
     tools
         .into_iter()
@@ -25,12 +52,12 @@ impl Bound {
     fn arguments(&self, args: &Value) -> Value {
         let mut args = args.clone();
         let key = match self.name() {
-            "read_file" | "write_file" | "list_dir" => "path",
+            "read_file" | "write_file" | "edit_file" | "list_dir" | "grep" | "glob" => "path",
             "shell" => "cwd",
             _ => return args,
         };
         let supplied = args.get(key).and_then(Value::as_str);
-        if supplied.is_none() && matches!(self.name(), "read_file" | "write_file") {
+        if supplied.is_none() && matches!(self.name(), "read_file" | "write_file" | "edit_file") {
             return args;
         }
         // Invalid explicit values stay invalid; defaults apply only when absent.
@@ -39,7 +66,8 @@ impl Bound {
         }
         let path = supplied.map_or_else(|| self.workspace.clone(), |p| self.workspace.join(p));
         if let Some(object) = args.as_object_mut() {
-            object.insert(key.into(), json!(path));
+            // Lossy only for display: run() rejects a non-UTF-8 workspace first.
+            object.insert(key.into(), json!(path.to_string_lossy()));
         }
         args
     }
@@ -59,7 +87,7 @@ impl Tool for Bound {
         self.tool.approval()
     }
     fn approval_arguments(&self, args: &Value) -> Value {
-        self.arguments(args)
+        self.tool.approval_arguments(&self.arguments(args))
     }
     fn requires_fresh_screen(&self) -> bool {
         self.tool.requires_fresh_screen()
@@ -67,9 +95,14 @@ impl Tool for Bound {
     fn run(&self, args: &Value) -> Result<String> {
         if matches!(
             self.name(),
-            "read_file" | "write_file" | "list_dir" | "shell"
+            "read_file" | "write_file" | "edit_file" | "list_dir" | "grep" | "glob" | "shell"
         ) {
             ensure!(args.is_object(), "tool arguments must be an object");
+            ensure!(
+                self.workspace.to_str().is_some(),
+                "workspace path is not valid UTF-8: {}",
+                self.workspace.display()
+            );
             let key = if self.name() == "shell" {
                 "cwd"
             } else {
@@ -104,6 +137,18 @@ mod tests {
         assert!(shell
             .run(&json!({"command":"printf invalid", "cwd":null}))
             .is_err());
+    }
+
+    #[test]
+    fn project_rules_are_read_and_bounded() {
+        let root = std::env::temp_dir().join(format!("usix-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(project_rules(&root).is_none());
+        std::fs::write(root.join("AGENTS.md"), "x".repeat(MAX_RULES_BYTES * 2)).unwrap();
+        let rules = project_rules(&root).unwrap();
+        assert!(rules.len() < MAX_RULES_BYTES + 32);
+        assert!(rules.ends_with("(AGENTS.md truncated)"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

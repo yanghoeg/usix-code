@@ -10,13 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 
-const SYSTEM_PROMPT: &str = "You are usix-code, a fully local coding and automation harness on this device. \
+pub(crate) const SYSTEM_PROMPT: &str = "You are usix-code, a fully local coding and automation harness on this device. \
 Use the provided tools to inspect the working environment and complete the user's task. \
 Use only registered tools; do not assume an operating system, cloud service, or remote machine. \
 Perform changes, shell commands, and message sending only through tools with human approval. \
 Never invent paths, recipients, or results; verify them with tools. Preserve user-supplied message text. \
 Use English for planning and tool work. Write concise final answers and user-facing choices in Korean \
 unless the user requests another language. Distinguish completed actions from unverified outcomes.";
+
+const TRIMMED: &str = "\nSkill and project instructions were omitted to fit the context window.";
 
 // 도구 호출 폭주 방지 (모델이 무한 호출하는 경우 차단).
 const MAX_STEPS: usize = 16;
@@ -46,13 +48,19 @@ pub struct Agent<'a> {
     awaiting: Option<Value>,  // 승인 대기 중인 변경 호출
     steps: usize,
     skills: Vec<Skill>, // 전체 로드분 — submit마다 요청 관련분만 프롬프트에 얹는다.
+    rules: Option<String>, // 작업 폴더의 AGENTS.md — 어댑터가 읽어 문자열로만 넘긴다.
 }
 
 impl<'a> Agent<'a> {
     pub fn skills_count(&self) -> usize {
         self.skills.len()
     }
-    pub fn new(llm: &'a dyn Llm, registry: &'a Registry, skills: Vec<Skill>) -> Self {
+    pub fn new(
+        llm: &'a dyn Llm,
+        registry: &'a Registry,
+        skills: Vec<Skill>,
+        rules: Option<String>,
+    ) -> Self {
         // 스킬은 로드만 해두고, 프롬프트에는 submit에서 요청 관련분만 얹는다. 무관한
         // 스킬 지침이 끼면 소형 모델이 후속 절차를 놓쳐(빈 응답) 흐름이 깨진다.
         let system = json!({ "role": "system", "content": SYSTEM_PROMPT });
@@ -65,16 +73,39 @@ impl<'a> Agent<'a> {
             awaiting: None,
             steps: 0,
             skills,
+            rules,
         }
+    }
+
+    /// 기본 정책 + 프로젝트 규칙 + 이번 요청과 관련된 스킬 지침.
+    fn system_content(&self, query: &str) -> String {
+        let relevant = crate::domain::skills::select(&self.skills, query);
+        let rules = self
+            .rules
+            .as_deref()
+            .map(|r| format!("\n\n# Project instructions (AGENTS.md)\n{r}"))
+            .unwrap_or_default();
+        format!(
+            "{SYSTEM_PROMPT}{rules}{}",
+            crate::domain::skills::guidance(&relevant)
+        )
+    }
+
+    /// 예산을 넘으면 선택적 지침(스킬·프로젝트 규칙)을 먼저 버린다. 요청·도구 결과는
+    /// context::fit 이 다루고, 그래도 넘치면 오류.
+    fn fit(&mut self, with_tools: bool) -> Result<()> {
+        let tools: &[Value] = if with_tools { &self.tools_schema } else { &[] };
+        if context::fit(&mut self.messages, tools, self.llm.budget()).is_ok() {
+            return Ok(());
+        }
+        self.messages[0] =
+            json!({ "role": "system", "content": format!("{SYSTEM_PROMPT}{TRIMMED}") });
+        context::fit(&mut self.messages, tools, self.llm.budget())
     }
 
     pub fn submit(&mut self, user: &str) {
         // 이번 요청과 관련된 스킬만 골라 system 프롬프트를 재구성한다.
-        let relevant = crate::domain::skills::select(&self.skills, user);
-        let content = format!(
-            "{SYSTEM_PROMPT}{}",
-            crate::domain::skills::guidance(&relevant)
-        );
+        let content = self.system_content(user);
         self.messages[0] = json!({ "role": "system", "content": content });
         self.messages
             .push(json!({ "role": "user", "content": user }));
@@ -95,6 +126,7 @@ impl<'a> Agent<'a> {
         registry: &'a Registry,
         state: AgentState,
         skills: Vec<Skill>,
+        rules: Option<String>,
     ) -> Result<Self> {
         ensure!(
             state.messages.first().and_then(|m| m["role"].as_str()) == Some("system"),
@@ -104,7 +136,7 @@ impl<'a> Agent<'a> {
             state.steps <= MAX_STEPS,
             "invalid task checkpoint: step count"
         );
-        let mut agent = Self::new(llm, registry, skills);
+        let mut agent = Self::new(llm, registry, skills, rules);
         agent.messages = state.messages;
         // Refresh guidance when a checkpoint moves between hosts or the harness is upgraded.
         let query = agent
@@ -113,9 +145,9 @@ impl<'a> Agent<'a> {
             .rev()
             .find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str())
-            .unwrap_or("");
-        let relevant = crate::domain::skills::select(&agent.skills, query);
-        agent.messages[0] = json!({"role": "system", "content": format!("{SYSTEM_PROMPT}{}", crate::domain::skills::guidance(&relevant))});
+            .unwrap_or("")
+            .to_owned();
+        agent.messages[0] = json!({"role": "system", "content": agent.system_content(&query)});
         agent.pending = state.pending;
         agent.awaiting = state.awaiting;
         agent.steps = state.steps;
@@ -246,7 +278,7 @@ impl<'a> Agent<'a> {
         );
 
         // Compact only between complete tool batches, never across a pending approval.
-        context::fit(&mut self.messages, &self.tools_schema, self.llm.budget())?;
+        self.fit(true)?;
         // 3) 모델 호출 (최종 답변은 sink 로 스트리밍).
         let mut msg = self
             .llm
@@ -290,7 +322,7 @@ impl<'a> Agent<'a> {
     /// 방금 저장한 빈 assistant 응답을 걷어내고, 도구 스키마 없이 다시 물어 자연어 답을 받는다.
     fn answer_without_tools(&mut self, sink: &mut dyn FnMut(&str)) -> Result<String> {
         self.messages.pop();
-        context::fit(&mut self.messages, &[], self.llm.budget())?;
+        self.fit(false)?;
         let msg = self.llm.chat_stream(&self.messages, &[], sink)?;
         ensure!(
             msg.get("tool_calls")

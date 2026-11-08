@@ -22,6 +22,17 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into())).join(".usix")
 }
 
+/// Total physical memory from the kernel; both Linux and Android expose /proc/meminfo.
+pub fn total_memory() -> Option<u64> {
+    parse_mem_total(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
 pub fn has_cmd(name: &str) -> bool {
     Command::new("sh")
         .args(["-c", "command -v \"$1\" >/dev/null 2>&1", "usix-code", name])
@@ -105,19 +116,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_mem_total_in_bytes() {
+        let meminfo = "MemTotal:       11381260 kB\nMemFree:          253724 kB\n";
+        assert_eq!(parse_mem_total(meminfo), Some(11381260 * 1024));
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_mem_total("MemTotal: lots kB\n"), None);
+    }
+
+    #[test]
     fn both_host_catalogs_fit_the_default_prompt_budget() {
         let workspace = std::path::Path::new("/project");
         for host in [&linux::Linux as &dyn Host, &termux::Termux as &dyn Host] {
             let registry = crate::domain::registry::Registry::new(host.tools(workspace));
-            let cost = crate::domain::context::prompt_cost(
-                &[
-                    serde_json::json!({"role":"system","content":"policy"}),
-                    serde_json::json!({"role":"user","content":"Read README.md"}),
-                ],
-                &registry.schemas(),
-            );
-            assert!(cost + 1500 < crate::domain::context::Budget::default().prompt_tokens(),
-                "{} catalog costs {cost} estimated tokens; no room for instructions and tool results", host.name());
+            let limit = crate::domain::context::Budget::default().prompt_tokens();
+            let cost = |guidance: String| {
+                crate::domain::context::prompt_cost(
+                    &[
+                        serde_json::json!({"role":"system","content":format!("{}{guidance}", crate::domain::agent::SYSTEM_PROMPT)}),
+                        serde_json::json!({"role":"user","content":"Read README.md"}),
+                    ],
+                    &registry.schemas(),
+                )
+            };
+            // The real policy must leave room for tool results.
+            let base = cost(String::new());
+            assert!(base + 1500 < limit,
+                "{} catalog costs {base} estimated tokens; no room for instructions and tool results", host.name());
+            // Any single bundled skill must still fit; context::fit shortens long tool results.
+            for source in host.bundled_skills() {
+                let skill = crate::domain::skills::parse(source.text).unwrap();
+                let with_skill = cost(crate::domain::skills::guidance(&[&skill]));
+                assert!(
+                    with_skill + 768 < limit,
+                    "{} with skill {} costs {with_skill} estimated tokens",
+                    host.name(),
+                    skill.name
+                );
+            }
         }
     }
 }

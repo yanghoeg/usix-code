@@ -72,7 +72,11 @@ pub fn run(mut agent: Agent, model_label: String) -> Result<()> {
                     run_shell(cmd);
                 } else {
                     agent.submit(&text);
-                    drive(&mut agent)?;
+                    // 모델·도구 오류 하나로 세션과 대화 내용을 잃지 않게 알리고 계속한다.
+                    if let Err(e) = drive(&mut agent) {
+                        clear_line();
+                        print_system(&format!("error: {e:#}"));
+                    }
                 }
             }
         }

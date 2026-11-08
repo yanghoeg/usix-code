@@ -38,12 +38,26 @@ fn load_from(dir: &Path, bundled: &[BundledSkill]) -> Vec<Skill> {
     with_builtins(skills, bundled)
 }
 
+// 스킬 하나가 8K 컨텍스트를 혼자 차지하지 않도록 본문 상한을 둔다.
+const MAX_SKILL_BODY: usize = 4 * 1024;
+
 fn parse_installed(text: &str, bundled: &[BundledSkill]) -> Option<Skill> {
     let current = bundled
         .iter()
         .find(|s| s.legacy == Some(text))
         .map_or(text, |s| s.text);
-    parse(current)
+    let mut skill = parse(current)?;
+    if skill.body.len() > MAX_SKILL_BODY {
+        let mut end = MAX_SKILL_BODY;
+        while !skill.body.is_char_boundary(end) {
+            end -= 1;
+        }
+        skill.body.truncate(end);
+        skill
+            .body
+            .push_str("\n…(skill truncated to fit the context window)");
+    }
+    Some(skill)
 }
 
 fn with_builtins(mut skills: Vec<Skill>, bundled: &[BundledSkill]) -> Vec<Skill> {
@@ -114,5 +128,13 @@ mod tests {
             .unwrap()
             .body
             .contains("custom instruction"));
+    }
+
+    #[test]
+    fn oversized_custom_skill_is_truncated() {
+        let text = format!("---\nname: big\ndescription: x\n---\n{}", "가".repeat(5000));
+        let skill = parse_installed(&text, &[]).unwrap();
+        assert!(skill.body.len() < MAX_SKILL_BODY + 64);
+        assert!(skill.body.ends_with("context window)"));
     }
 }

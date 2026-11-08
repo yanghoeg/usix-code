@@ -196,6 +196,7 @@ fn execute(
     let llm = crate::backend()?;
     let registry = Registry::new(host.tools(&workspace));
     let skills = crate::adapters::skills::load(host.bundled_skills());
+    let rules = crate::adapters::workspace::project_rules(&workspace);
     host.reset_tools();
     let mut backend_guard = None;
     let mut prepare = || {
@@ -214,7 +215,7 @@ fn execute(
         id,
         llm.as_ref(),
         &registry,
-        skills,
+        runner::Guidance { skills, rules },
         approval,
         &mut prepare,
     )

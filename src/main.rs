@@ -39,6 +39,7 @@ fn main() -> anyhow::Result<()> {
                 llm.as_ref(),
                 &registry,
                 adapters::skills::load(host.bundled_skills()),
+                adapters::workspace::project_rules(&workspace),
             );
             tui::run(agent, model_label())?;
         }
@@ -62,13 +63,16 @@ fn backend() -> anyhow::Result<Box<dyn Llm>> {
             adapters::ollama_port()?,
         )))
     } else {
-        Ok(Box::new(LlamaCpp::new(budget, adapters::llama_port()?)))
+        Ok(Box::new(LlamaCpp::new(
+            bootstrap::served_budget(budget)?,
+            adapters::llama_port()?,
+        )))
     }
 }
 
 // 현재 백엔드/모델을 짧게 라벨링 — TUI 하단·배너 표기용.
 fn model_label() -> String {
-    if std::env::var("USIX_BACKEND").as_deref() == Ok("ollama") {
+    if matches!(bootstrap::backend(), Ok(Backend::Ollama)) {
         bootstrap::ollama_model()
     } else {
         let path = bootstrap::llama_model_path();
@@ -91,6 +95,7 @@ fn one_shot(q: &str, host: &dyn Host) -> anyhow::Result<()> {
         llm.as_ref(),
         &registry,
         adapters::skills::load(host.bundled_skills()),
+        adapters::workspace::project_rules(&workspace),
     );
     agent.submit(q);
     let mut sink = |_: &str| {};
