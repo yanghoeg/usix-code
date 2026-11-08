@@ -141,6 +141,11 @@ Honest caveats:
   running (the listener service keeps it alive) for the tools to respond. Android apps share
   one loopback interface, so binding alone can't tell callers apart — every request carries a
   bearer token the app generates on first launch (`~/.usix/companion_token` on the Termux
-  side, written by `usix-code pair`). Requests without it get `401`; only `/health` is open.
+  side, written by `usix-code pair`). Requests without it get `401`; only `/health` and
+  `/proof` are open. The same sharing works the other way: while the app is stopped, another
+  app could listen on 8760. Before each request, usix-code sends a random challenge to
+  `/proof` and sends the token only if the reply equals `HMAC-SHA256(token,
+  "usix-companion-proof-v1:" + challenge)`. A companion build without `/proof` is refused;
+  set `USIX_COMPANION_LEGACY_AUTH=1` to send the token anyway until the app is updated.
 - **No Gradle wrapper committed.** The usix-companion repo omits the wrapper jar; CI builds
   with a pinned Gradle version, and local builds use a system `gradle` or Android Studio.

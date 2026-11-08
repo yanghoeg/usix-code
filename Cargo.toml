@@ -20,6 +20,9 @@ ratatui = { version = "0.29", default-features = false, features = ["crossterm"]
 unicode-width = "0.2"
 # grep 도구 정규식
 regex = "1"
+# companion 앱 신원 증명(HMAC-SHA256) 확인
+hmac = "0.12"
+sha2 = "0.10"
 # 셸 명령 구조 해석 — 파국 명령 차단 (usix 에서 이식)
 usix-shellast = { path = "crates/usix-shellast" }
 
