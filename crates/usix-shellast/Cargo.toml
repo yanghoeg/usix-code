@@ -1,0 +1,13 @@
+# usix-shellast — tree-sitter-bash 기반 셸 명령어 구조 해석(보안 판정용).
+# ../usix/crates/usix-shellast 에서 이식. 순수·I/O 0 리프 crate — tools/shell.rs 만 의존한다.
+[package]
+name        = "usix-shellast"
+description = "Shell command structure resolution for security policy — tree-sitter-bash, pure, I/O-free"
+publish     = false
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT"
+
+[dependencies]
+tree-sitter      = { version = "0.26", default-features = false, features = ["std"] }
+tree-sitter-bash = { version = "0.25", default-features = false }

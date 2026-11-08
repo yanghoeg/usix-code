@@ -100,18 +100,36 @@ llama.cpp uses `127.0.0.1:8080` and Ollama uses `127.0.0.1:11434`.
 `USIX_LLAMA_PORT` and `USIX_OLLAMA_PORT` override those ports; the address stays
 loopback-only. Model HTTP requests do not follow redirects.
 
+Every app on a device shares loopback, so an open port proves nothing. Each
+llama-server the harness starts gets a random `--alias`, and startup waits until
+`/v1/models` reports that alias. A server that is already running, llama.cpp or
+Ollama (for example a system Ollama service), is refused unless
+`USIX_REUSE_SERVER=1` is set. A reused llama-server's window is read from `/props`
+and the budget shrinks to fit it.
+
 Logs live in `~/.usix/logs`. Setup, chat, and workers stop the backend they start.
 A private pipe connects each owned backend's supervisor to its harness process;
 closing it, including after a signal or crash, stops the backend process group and
 its wrapper descendants. Existing servers stay running. There is no harness daemon
 or automatic startup service; local inference still needs a model engine process.
 
-The default context budget is 8192 tokens with 1024 reserved for model output.
-Configure it with `USIX_CONTEXT_TOKENS` and `USIX_OUTPUT_TOKENS`. Before inference,
+The default context budget follows total memory, like Ollama's tiers:
+
+| Total memory | Context | Output |
+| --- | --- | --- |
+| under 16 GiB or unknown | 8192 | 1024 |
+| 16–64 GiB | 32768 | 4096 |
+| 64 GiB or more | 65536 | 4096 |
+
+`USIX_CONTEXT_TOKENS` and `USIX_OUTPUT_TOKENS` override it; without an explicit
+output, the reservation is one eighth of the context (1024–4096).
+`usix-code doctor` shows the chosen values. Set the context yourself for a model
+trained on a shorter window, or for a reused Ollama server. Before inference,
 the harness estimates messages and tool schemas with extra safety space, removes
 older completed turns, then shortens large tool results with explicit markers.
 It preserves the latest request, tool arguments, and call/result pairs and rejects
-requests that still exceed the budget. This is a conservative estimate, not the
+requests that still exceed the budget. If skill or project instructions are what
+overflows, they are dropped first. This is a conservative estimate, not the
 model's exact tokenizer.
 
 ## Usage and tools
@@ -126,13 +144,19 @@ usix-code worker --once    # process currently due work
 
 | Shared tool | Approval |
 | --- | --- |
-| `read_file`, `list_dir`, `task_list` | Automatic |
-| `shell`, `write_file`, `task_create`, `task_cancel` | Required |
+| `read_file`, `list_dir`, `grep`, `glob`, `task_list` | Automatic |
+| `shell`, `write_file`, `edit_file`, `task_create`, `task_cancel` | Required |
 
 Changing actions show complete, escaped arguments and resolved file paths before
 human approval. One-shot queries deny them; background
 tasks wait for approval through `usix-code task run ID`. Tools use your OS account's
 access; approval is not a filesystem sandbox. [Task guide](docs/tasks.md).
+`shell` has no stdin and stops background processes when the command ends.
+Catastrophic commands such as recursive deletion of `/` or `~` are refused even
+when approved; the check parses the command with tree-sitter-bash
+(`crates/usix-shellast`), so quoting and split flags do not bypass it.
+
+An `AGENTS.md` at the workspace root is added to the instructions (first 4 KiB).
 
 Skills are Markdown procedures in `~/.usix/skills`. Both hosts include a local
 coding workflow; Termux adds SMS, mail, and chat workflows. User-edited skills are

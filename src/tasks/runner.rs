@@ -18,17 +18,25 @@ impl<'a> Persistence<'a> {
     }
 }
 
+/// Instructions loaded by adapters: skills and the workspace's AGENTS.md.
+#[derive(Default)]
+pub struct Guidance {
+    pub skills: Vec<Skill>,
+    pub rules: Option<String>,
+}
+
 /// The caller holds the execution lock. No approval decision is stored for reuse.
 pub fn run(
     persistence: Persistence<'_>,
     id: u64,
     llm: &dyn Llm,
     registry: &Registry,
-    skills: Vec<Skill>,
+    guidance: Guidance,
     mut approval: Approval<'_>,
     prepare: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Task> {
     let Persistence { store, clock } = persistence;
+    let Guidance { skills, rules } = guidance;
     let mut task = store.get(id)?;
     ensure!(
         matches!(
@@ -41,9 +49,9 @@ pub fn run(
     ensure!(!task.action_in_flight,
         "an approved action may have executed; inspect the affected state, then use `task retry {id}` if starting over is appropriate");
     let mut agent = match task.checkpoint.clone() {
-        Some(state) => Agent::restore(llm, registry, state, skills)?,
+        Some(state) => Agent::restore(llm, registry, state, skills, rules)?,
         None => {
-            let mut agent = Agent::new(llm, registry, skills);
+            let mut agent = Agent::new(llm, registry, skills, rules);
             agent.submit(&task.prompt);
             agent
         }
@@ -236,7 +244,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(()),
         )
@@ -252,7 +260,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |desc| {
                 approvals.push(desc.to_owned());
                 Ok(true)
@@ -285,7 +293,7 @@ mod tests {
             task.id,
             &Scripted::new(vec![answer()]),
             &Registry::new(Vec::new()),
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(()),
         )
@@ -307,7 +315,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |_| Ok(false)),
             &mut || Ok(()),
         )
@@ -330,7 +338,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |_| {
                 approvals += 1;
                 Ok(true)
@@ -346,7 +354,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(()),
         )
@@ -368,7 +376,7 @@ mod tests {
                 task.id,
                 &llm,
                 &registry,
-                Vec::new(),
+                Guidance::default(),
                 Some(&mut |_| Ok(true)),
                 &mut || Ok(()),
             )
@@ -386,7 +394,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |_| Ok(true)),
             &mut || Ok(())
         )
@@ -406,7 +414,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(())
         )
@@ -417,7 +425,7 @@ mod tests {
             task.id,
             &Scripted::new(vec![answer()]),
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(()),
         )
@@ -438,7 +446,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |_| {
                 fixture.store.cancel(task.id, TEST_CLOCK.now())?;
                 Ok(true)
@@ -465,7 +473,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || bail!("backend unavailable")
         )
@@ -478,7 +486,7 @@ mod tests {
             task.id,
             &llm,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(())
         )
@@ -508,7 +516,7 @@ mod tests {
                 task.id,
                 &Scripted::new(replies),
                 &registry,
-                Vec::new(),
+                Guidance::default(),
                 None,
                 &mut || Ok(())
             )
@@ -519,7 +527,7 @@ mod tests {
                 task.id,
                 &llm,
                 &registry,
-                Vec::new(),
+                Guidance::default(),
                 None,
                 &mut || Ok(()),
             )
@@ -566,7 +574,7 @@ mod tests {
             task.id,
             &first,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             None,
             &mut || Ok(()),
         )
@@ -579,7 +587,7 @@ mod tests {
             task.id,
             &resumed,
             &registry,
-            Vec::new(),
+            Guidance::default(),
             Some(&mut |_| {
                 assert_eq!(reads.load(Ordering::SeqCst), 1);
                 approvals += 1;

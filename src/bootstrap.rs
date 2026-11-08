@@ -1,10 +1,10 @@
 //! Setup/doctor application services. Platform operations go through the Host port.
 use crate::adapters::{
-    host::{has_cmd, state_dir},
+    host::{has_cmd, state_dir, total_memory},
     runtime::{self, OwnedServer},
     skills,
 };
-use crate::domain::context::Budget;
+use crate::domain::context::{default_output, Budget};
 use crate::ports::{Backend, Host};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
@@ -21,20 +21,26 @@ fn ollama_host() -> Result<String> {
     Ok(format!("127.0.0.1:{}", crate::adapters::ollama_port()?))
 }
 
-pub fn context_budget() -> Result<Budget> {
-    fn setting(name: &str, default: usize) -> Result<usize> {
-        match std::env::var(name) {
-            Ok(value) => value
-                .parse()
-                .with_context(|| format!("{name} must be an integer")),
-            Err(std::env::VarError::NotPresent) => Ok(default),
-            Err(error) => Err(error.into()),
-        }
+fn setting(name: &str) -> Result<Option<usize>> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map(Some)
+            .with_context(|| format!("{name} must be an integer")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    Budget::new(
-        setting("USIX_CONTEXT_TOKENS", 8192)?,
-        setting("USIX_OUTPUT_TOKENS", 1024)?,
-    )
+}
+
+/// Explicit settings win; otherwise the window follows total memory (Ollama-style tiers)
+/// and the output reservation follows the window.
+pub fn context_budget() -> Result<Budget> {
+    let context = match setting("USIX_CONTEXT_TOKENS")? {
+        Some(tokens) => tokens,
+        None => Budget::for_memory(total_memory()).context_tokens,
+    };
+    let output = setting("USIX_OUTPUT_TOKENS")?.unwrap_or_else(|| default_output(context));
+    Budget::new(context, output)
 }
 
 pub fn backend() -> Result<Backend> {
@@ -84,6 +90,43 @@ fn server_up(backend: Backend) -> bool {
             .and_then(|port| probe(&format!("http://127.0.0.1:{port}/health")))
             .is_some_and(|body| body["status"] == "ok"),
     }
+}
+
+/// Loopback is shared by every app on the device, so a listening port proves nothing.
+/// Each llama-server we start gets a random alias that only this process knows.
+fn nonce() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("read /dev/urandom")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn serves_alias(alias: &str) -> bool {
+    crate::adapters::llama_port()
+        .ok()
+        .and_then(|port| probe(&format!("http://127.0.0.1:{port}/v1/models")))
+        .and_then(|body| body["data"].as_array().cloned())
+        .is_some_and(|models| models.iter().any(|m| m["id"] == alias))
+}
+
+/// A reused llama-server keeps its own `-c`; shrink the budget to the slot size it
+/// reports so requests never exceed what the server can hold.
+pub fn served_budget(budget: Budget) -> Result<Budget> {
+    let served = crate::adapters::llama_port()
+        .ok()
+        .and_then(|port| probe(&format!("http://127.0.0.1:{port}/props")))
+        .and_then(|body| body["default_generation_settings"]["n_ctx"].as_u64())
+        .and_then(|n| usize::try_from(n).ok());
+    match served {
+        Some(n) if n < budget.context_tokens => Budget::new(n, budget.output_tokens.min(n / 2))
+            .with_context(|| format!("the running llama-server only holds {n} tokens per request")),
+        _ => Ok(budget),
+    }
+}
+
+fn reuse_allowed() -> bool {
+    std::env::var("USIX_REUSE_SERVER").as_deref() == Ok("1")
 }
 
 fn ollama_command() -> Result<Command> {
@@ -177,8 +220,18 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
         crate::adapters::ollama::validate_model_name(&ollama_model())?;
     }
     if server_up(backend) {
+        let port = match backend {
+            Backend::Llama => crate::adapters::llama_port()?,
+            Backend::Ollama => crate::adapters::ollama_port()?,
+        };
+        ensure!(
+            reuse_allowed(),
+            "another {} server is already listening on 127.0.0.1:{port}; stop it, or set USIX_REUSE_SERVER=1 to trust it",
+            backend.name()
+        );
         return Ok(None);
     }
+    let alias = nonce()?;
     let mut spec = host.backend_launch(backend);
     let attempts = match backend {
         Backend::Ollama => {
@@ -204,6 +257,8 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
                 "--parallel".into(),
                 "1".into(),
                 "--jinja".into(),
+                "--alias".into(),
+                alias.clone(),
             ]);
             240
         }
@@ -223,7 +278,11 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
                 log.display()
             );
         }
-        if server_up(backend) {
+        let ready = match backend {
+            Backend::Llama => serves_alias(&alias),
+            Backend::Ollama => server_up(backend),
+        };
+        if ready {
             return Ok(owned.0.take());
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -312,6 +371,18 @@ pub fn doctor(host: &dyn Host) -> Result<()> {
             ollama_model()
         ),
     }
+    let budget = context_budget()?;
+    let source = if std::env::var_os("USIX_CONTEXT_TOKENS").is_some() {
+        "USIX_CONTEXT_TOKENS".to_string()
+    } else {
+        total_memory().map_or("auto: memory unknown".into(), |bytes| {
+            format!("auto: {} GiB RAM", bytes >> 30)
+        })
+    };
+    println!(
+        "context: {} tokens, output {} ({source})",
+        budget.context_tokens, budget.output_tokens
+    );
     for cmd in ["bash", "timeout"] {
         println!("{} {cmd}", mark(has_cmd(cmd)));
     }

@@ -47,19 +47,19 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// 요청과 관련된 스킬만 고른다 — 소형 모델은 무관한 스킬 지침이 끼면 후속 절차를
-/// 놓친다(빈 응답). 요청 토큰과 스킬 토큰이 어느 방향으로든 포함되면 채택한다. 양방향
-/// 비교라 한국어 조사("카톡에"→"카톡")로 어미가 붙어도 스킬 키워드에 걸린다.
+/// 놓친다(빈 응답). 비교 대상은 스킬 이름 전체와 description 토큰뿐이다(body·이름 조각은
+/// 제외: "read" 가 kakao_read 에 걸려 예산을 넘기던 원인). 요청 토큰이 스킬 토큰과 같거나
+/// 그것으로 시작하면 채택한다 — 한국어 조사("카톡에"→"카톡")가 붙어도 걸린다.
 pub fn select<'a>(skills: &'a [Skill], query: &str) -> Vec<&'a Skill> {
-    let q_tokens = tokenize(query);
+    let query = query.to_lowercase();
+    let q_tokens = tokenize(&query);
     let mut out = Vec::new();
     for sk in skills {
-        let hay = format!("{} {} {}", sk.name, sk.description, sk.body);
-        let s_tokens = tokenize(&hay);
-        let hit = q_tokens.iter().any(|qt| {
-            s_tokens
+        let s_tokens = tokenize(&sk.description);
+        let hit = query.contains(&sk.name.to_lowercase())
+            || q_tokens
                 .iter()
-                .any(|st| st.contains(qt.as_str()) || qt.contains(st.as_str()))
-        });
+                .any(|qt| s_tokens.iter().any(|st| qt.starts_with(st.as_str())));
         if hit {
             out.push(sk);
             if out.len() >= MAX_ACTIVE {
@@ -135,5 +135,16 @@ mod tests {
         let hit = select(&skills, "카톡에 뭐보여?");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].name, "kakao_notify");
+    }
+
+    #[test]
+    fn select_ignores_name_fragments_and_body() {
+        let skills = vec![Skill {
+            name: "kakao_read".into(),
+            description: "카카오톡 카톡 메시지 요약".into(),
+            body: "README read 절차".into(),
+        }];
+        assert!(select(&skills, "Read README.md").is_empty());
+        assert_eq!(select(&skills, "kakao_read 써줘").len(), 1);
     }
 }

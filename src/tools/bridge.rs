@@ -38,12 +38,19 @@ pub fn save_token(t: &str) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, format!("{t}\n"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // 쓰기 전에 0600 으로 만든다 — 내용이 umask 권한으로 잠깐이라도 노출되지 않게.
+    // 이미 있던 파일은 mode() 가 적용되지 않으므로 권한을 먼저 다시 맞춘다.
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.set_len(0)?;
+    file.write_all(format!("{t}\n").as_bytes())?;
     Ok(path)
 }
 

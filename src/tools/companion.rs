@@ -13,13 +13,13 @@ impl Tool for NotifList {
         "notif_list"
     }
     fn description(&self) -> &str {
-        "카카오톡·라인 등 다른 앱의 최근 알림(제목·내용·답장 가능 여부·key)을 조회한다. '카톡 뭐 왔어' 같은 요청에 쓴다."
+        "List recent notifications from other apps such as KakaoTalk (title, text, replyable, key)."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "package": { "type": "string", "description": "앱 패키지로 거르기 (예: com.kakao.talk, 생략 시 전체)" }
+                "package": { "type": "string", "description": "Filter by app package, e.g. com.kakao.talk" }
             }
         })
     }
@@ -48,14 +48,14 @@ impl Tool for NotifReply {
         "notif_reply"
     }
     fn description(&self) -> &str {
-        "notif_list 로 조회한 알림에 인라인 답장을 보낸다. key 는 notif_list 결과의 key 값을 그대로 쓴다(지어내지 말 것). 카톡 등 답장 가능한 알림에만 된다."
+        "Send an inline reply to a replyable notification. Use the exact key from notif_list."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "key": { "type": "string", "description": "notif_list 결과의 알림 key" },
-                "text": { "type": "string", "description": "보낼 답장 내용" }
+                "key": { "type": "string", "description": "Notification key from notif_list" },
+                "text": { "type": "string", "description": "Reply text" }
             },
             "required": ["key", "text"]
         })

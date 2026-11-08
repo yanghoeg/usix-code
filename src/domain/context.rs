@@ -34,9 +34,29 @@ impl Budget {
         })
     }
 
+    /// Tiered default by total memory, like Ollama's VRAM tiers. 64k is the ceiling
+    /// Ollama recommends for agents; larger windows make every request heavier.
+    pub fn for_memory(total_bytes: Option<u64>) -> Self {
+        const GIB: u64 = 1 << 30;
+        let context_tokens = match total_bytes {
+            Some(bytes) if bytes >= 64 * GIB => 65536,
+            Some(bytes) if bytes >= 16 * GIB => 32768,
+            _ => 8192,
+        };
+        Self {
+            context_tokens,
+            output_tokens: default_output(context_tokens),
+        }
+    }
+
     pub fn prompt_tokens(self) -> usize {
         self.context_tokens.saturating_sub(self.output_tokens + 256)
     }
+}
+
+/// Output reservation that grows with the window: 1024 at 8k, 4096 from 32k.
+pub fn default_output(context_tokens: usize) -> usize {
+    (context_tokens / 8).clamp(1024, 4096)
 }
 
 fn estimate(text: &str) -> usize {
@@ -129,6 +149,26 @@ mod tests {
             .unwrap()
             .ends_with(TRUNCATED));
         assert!(prompt_cost(&messages, &[]) <= 1536);
+    }
+
+    #[test]
+    fn memory_tiers_choose_context_and_output() {
+        const GIB: u64 = 1 << 30;
+        let tier = |bytes| {
+            let b = Budget::for_memory(bytes);
+            (b.context_tokens, b.output_tokens)
+        };
+        assert_eq!(tier(None), (8192, 1024));
+        assert_eq!(tier(Some(16 * GIB - 1)), (8192, 1024));
+        assert_eq!(tier(Some(16 * GIB)), (32768, 4096));
+        assert_eq!(tier(Some(64 * GIB - 1)), (32768, 4096));
+        assert_eq!(tier(Some(128 * GIB)), (65536, 4096));
+        for bytes in [None, Some(32 * GIB), Some(128 * GIB)] {
+            let b = Budget::for_memory(bytes);
+            assert!(Budget::new(b.context_tokens, b.output_tokens).is_ok());
+        }
+        assert_eq!(default_output(4096), 1024);
+        assert_eq!(default_output(16384), 2048);
     }
 
     #[test]

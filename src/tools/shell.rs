@@ -1,10 +1,11 @@
 // TOOLS — 셸/파일. usix `usix-tools`(bash/file_ops)를 폰 규모로 축약.
-// shell·write_file 은 Mutating(승인), read_file·list_dir 은 ReadOnly(자동).
+// shell·write_file·edit_file 은 Mutating(승인), read_file·list_dir 은 ReadOnly(자동).
 use crate::ports::{ApprovalClass, Tool};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::thread;
 
@@ -35,6 +36,19 @@ const BLOCKED: &[&str] = &[
     "of=/dev/",
     "> /dev/",
 ];
+
+/// 회복 불가 파괴 명령인가 — 부분문자열 목록 **또는** AST 해석(usix-shellast).
+/// AST 는 인용 분할(`r"m" -rf /`)·플래그 분리(`rm -r -f /`) 같은 변형을 잡고, 부분문자열은
+/// AST 가 못 보는 경우(`bash -c 'rm -rf /'` 등)를 우연히 잡는다. usix 와 같은 OR 계약.
+fn blocked(cmd: &str) -> Option<String> {
+    let low = normalize(cmd);
+    if let Some(p) = BLOCKED.iter().find(|p| low.contains(**p)) {
+        return Some((*p).to_string());
+    }
+    usix_shellast::scan(cmd)
+        .has_catastrophic_recursive_delete()
+        .then(|| "recursive delete of / or ~".to_string())
+}
 
 /// BLOCKED 대조용 — 소문자 + 연속 공백을 한 칸으로(`rm   -rf   /` 같은 변형 흡수).
 fn normalize(cmd: &str) -> String {
@@ -87,14 +101,14 @@ impl Tool for Shell {
         "shell"
     }
     fn description(&self) -> &str {
-        "이 기기에서 bash 셸 명령을 실행하고 stdout·stderr·종료코드를 돌려준다. 코드·파일·git·테스트 등 로컬 작업에 쓴다."
+        "Run a bash command; returns output and exit code. No stdin. Background processes are killed when it ends (use setsid cmd >log 2>&1 & to keep one)."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "실행할 bash 명령" },
-                "cwd": { "type": "string", "description": "작업 디렉토리 (생략 시 현재)" }
+                "command": { "type": "string", "description": "Bash command" },
+                "cwd": { "type": "string", "description": "Working directory (default workspace)" }
             },
             "required": ["command"]
         })
@@ -102,10 +116,23 @@ impl Tool for Shell {
     fn approval(&self) -> ApprovalClass {
         ApprovalClass::Mutating
     }
+    fn approval_arguments(&self, args: &Value) -> Value {
+        let mut shown = args.clone();
+        let opaque = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|cmd| usix_shellast::scan(cmd).uncertain);
+        if let (true, Some(object)) = (opaque, shown.as_object_mut()) {
+            object.insert(
+                "warning".into(),
+                json!("⚠ 구조 해석 불가(불투명 인자) — 명령 원문을 직접 확인하라"),
+            );
+        }
+        shown
+    }
     fn run(&self, args: &Value) -> Result<String> {
         let cmd = required_str(args, "command")?;
-        let low = normalize(cmd);
-        if let Some(p) = BLOCKED.iter().find(|p| low.contains(**p)) {
+        if let Some(p) = blocked(cmd) {
             return Err(anyhow!("차단됨: 파괴적 명령 '{p}' 은 실행하지 않는다."));
         }
         let mut c = Command::new("timeout");
@@ -113,7 +140,11 @@ impl Tool for Shell {
         if let Some(d) = args.get("cwd").and_then(|v| v.as_str()) {
             c.current_dir(d);
         }
+        // 자체 프로세스 그룹: 끝난 뒤 남은 백그라운드 자식이 파이프를 쥐고 reader 를 영구
+        // 대기시키지 않도록 그룹째 정리한다. stdin 이 없어 대화형 명령은 즉시 EOF.
         let mut child = c
+            .process_group(0)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -128,7 +159,14 @@ impl Tool for Shell {
             .ok_or_else(|| anyhow!("셸 stderr 파이프를 열 수 없음"))?;
         let stdout_reader = thread::spawn(move || capture_limited(stdout));
         let stderr_reader = thread::spawn(move || capture_limited(stderr));
-        let status = child.wait().map_err(|e| anyhow!("셸 대기 실패: {e}"))?;
+        let status = child.wait().map_err(|e| anyhow!("셸 대기 실패: {e}"));
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            // SAFETY: kill(2) 은 메모리를 건드리지 않는다. 음수 pid = 우리가 만든 그룹.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let status = status?;
         let stdout = stdout_reader
             .join()
             .map_err(|_| anyhow!("셸 stdout reader 실패"))?
@@ -188,21 +226,47 @@ fn render_lines(c: &str, offset: usize, limit: usize) -> String {
     }
 }
 
+/// 일반 파일만, 상한까지만 읽는다 — /dev/zero·FIFO 처럼 len 이 0 인 특수 파일이
+/// 메모리를 무한히 잡거나 영구 대기하지 않게 한다. read_file·edit_file·grep 공용.
+pub(crate) fn read_text(path: &str) -> Result<String> {
+    let meta = std::fs::metadata(path).map_err(|e| anyhow!("{path} 읽기 실패: {e}"))?;
+    if !meta.is_file() {
+        return Err(anyhow!("{path} 는 일반 파일이 아님"));
+    }
+    let too_big = || {
+        anyhow!(
+            "{path} 는 너무 큼 (> {} KiB) — shell 도구로 head/sed/grep 을 써서 필요한 부분만 읽어라.",
+            MAX_READ_BYTES / 1024
+        )
+    };
+    if meta.len() > MAX_READ_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_READ_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(|e| anyhow!("{path} 읽기 실패: {e}"))?;
+    if bytes.len() as u64 > MAX_READ_BYTES {
+        return Err(too_big());
+    }
+    String::from_utf8(bytes).map_err(|_| anyhow!("{path} 는 UTF-8 텍스트가 아님"))
+}
+
 pub struct ReadFile;
 impl Tool for ReadFile {
     fn name(&self) -> &str {
         "read_file"
     }
     fn description(&self) -> &str {
-        "텍스트 파일 내용을 읽는다. 큰 파일은 offset·limit(줄 단위)으로 나눠 읽는다."
+        "Read a text file. Use offset/limit (lines) for large files."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "파일 경로" },
-                "offset": { "type": "integer", "description": "시작 줄(0부터)" },
-                "limit": { "type": "integer", "description": "읽을 줄 수 (기본/최대 1500)" }
+                "path": { "type": "string", "description": "File path" },
+                "offset": { "type": "integer", "description": "First line (0-based)" },
+                "limit": { "type": "integer", "description": "Lines to read (max 1500)" }
             },
             "required": ["path"]
         })
@@ -223,18 +287,7 @@ impl Tool for ReadFile {
             .map(|v| v.min(usize::MAX as u64) as usize)
             .unwrap_or(MAX_READ_LINES)
             .min(MAX_READ_LINES);
-        let size = std::fs::metadata(path)
-            .map_err(|e| anyhow!("{path} 읽기 실패: {e}"))?
-            .len();
-        if size > MAX_READ_BYTES {
-            return Err(anyhow!(
-                "{path} 는 너무 큼 ({} KiB > {} KiB) — shell 도구로 head/sed/grep 을 써서 필요한 부분만 읽어라.",
-                size / 1024,
-                MAX_READ_BYTES / 1024
-            ));
-        }
-        let content =
-            std::fs::read_to_string(path).map_err(|e| anyhow!("{path} 읽기 실패: {e}"))?;
+        let content = read_text(path)?;
         Ok(render_lines(&content, offset, limit))
     }
 }
@@ -245,14 +298,14 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> &str {
-        "텍스트 파일을 쓴다(있으면 덮어씀). 상위 폴더가 없으면 만든다."
+        "Write a whole text file (overwrites). Prefer edit_file for changes."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "파일 경로" },
-                "content": { "type": "string", "description": "기록할 내용" }
+                "path": { "type": "string", "description": "File path" },
+                "content": { "type": "string", "description": "File content" }
             },
             "required": ["path", "content"]
         })
@@ -273,6 +326,89 @@ impl Tool for WriteFile {
     }
 }
 
+pub struct EditFile;
+impl Tool for EditFile {
+    fn name(&self) -> &str {
+        "edit_file"
+    }
+    fn description(&self) -> &str {
+        "Replace old_string with new_string in a file. old_string must match exactly once unless replace_all."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File path" },
+                "old_string": { "type": "string", "description": "Exact existing text" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every match" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+    fn approval(&self) -> ApprovalClass {
+        ApprovalClass::Mutating
+    }
+    fn run(&self, args: &Value) -> Result<String> {
+        let path = required_str(args, "path")?;
+        let old = required_str(args, "old_string")?;
+        let new = required_str(args, "new_string")?;
+        let all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if old.is_empty() {
+            return Err(anyhow!("old_string 이 비어 있음"));
+        }
+        let content = read_text(path)?;
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(anyhow!(
+                "{path} 에서 old_string 을 찾지 못함 — read_file 로 정확한 원문을 확인하라."
+            ));
+        }
+        if count > 1 && !all {
+            return Err(anyhow!(
+                "{count}곳 일치 — 문맥을 넓혀 한 곳만 맞추거나 replace_all=true 로 호출하라."
+            ));
+        }
+        let updated = if all {
+            content.replace(old, new)
+        } else {
+            content.replacen(old, new, 1)
+        };
+        // 같은 폴더의 임시 파일에 쓰고 rename — 중간 실패가 원본을 반쯤 덮지 않게.
+        let target = std::path::Path::new(path);
+        let tmp = target.with_file_name(format!(
+            ".{}.usix-edit.{}",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            std::process::id()
+        ));
+        let result = std::fs::write(&tmp, &updated)
+            .and_then(|_| std::fs::set_permissions(&tmp, std::fs::metadata(target)?.permissions()))
+            .and_then(|_| std::fs::rename(&tmp, target));
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow!("{path} 쓰기 실패: {e}"));
+        }
+        let preview = |prefix: char, text: &str| {
+            text.lines()
+                .take(5)
+                .map(|l| format!("{prefix} {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(format!(
+            "{count}곳 수정 → {path}\n{}\n{}",
+            preview('-', old),
+            preview('+', new)
+        ))
+    }
+}
+
 pub struct ListDir;
 const MAX_DIR_ENTRIES: usize = 500;
 const MAX_DIR_OUTPUT_BYTES: usize = 16 * 1024;
@@ -282,13 +418,13 @@ impl Tool for ListDir {
         "list_dir"
     }
     fn description(&self) -> &str {
-        "디렉토리 내용을 나열한다(폴더는 끝에 /)."
+        "List a directory (folders end with /)."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "디렉토리 경로 (기본 현재, 최대 500개/16KiB 표시)" }
+                "path": { "type": "string", "description": "Directory (default workspace)" }
             }
         })
     }
@@ -353,6 +489,10 @@ mod tests {
             "sudo rm -fr ~",
             "RM  -rf   /*",
             "rm\t-rf\t/",
+            "r\"m\" -rf /",
+            "rm -r -f /",
+            "r\\m -rf ~",
+            "rm --recursive --force /etc",
         ] {
             let r = Shell.run(&json!({ "command": bad }));
             assert!(r.is_err(), "파괴 명령이 통과됨: {bad}");
@@ -370,6 +510,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("너무 큼"), "크기 상한이 안 걸림: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_returns_despite_background_children_and_has_no_stdin() {
+        let start = std::time::Instant::now();
+        let out = Shell
+            .run(&json!({ "command": "sleep 30 & read x; echo eof=$?" }))
+            .unwrap();
+        assert!(out.contains("eof=1"), "stdin 이 닫혀 있지 않음: {out}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "백그라운드 자식 때문에 대기함"
+        );
+    }
+
+    #[test]
+    fn read_rejects_special_files() {
+        let e = ReadFile
+            .run(&json!({ "path": "/dev/zero" }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("일반 파일이 아님"), "{e}");
+    }
+
+    #[test]
+    fn edit_requires_unique_match_unless_replace_all() {
+        let dir = std::env::temp_dir().join(format!("usix_edit_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        let p = path.to_string_lossy().to_string();
+        std::fs::write(&path, "a x\nb x\n").unwrap();
+        let e = EditFile
+            .run(&json!({ "path": p, "old_string": "x", "new_string": "y" }))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("2곳 일치"), "{e}");
+        assert!(EditFile
+            .run(&json!({ "path": p, "old_string": "zz", "new_string": "y" }))
+            .is_err());
+        EditFile
+            .run(&json!({ "path": p, "old_string": "b x", "new_string": "b y" }))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a x\nb y\n");
+        EditFile
+            .run(&json!({ "path": p, "old_string": "a", "new_string": "c", "replace_all": true }))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "c x\nb y\n");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "임시 파일이 남음"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

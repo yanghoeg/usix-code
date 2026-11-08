@@ -139,13 +139,13 @@ impl Tool for Screen {
         "ui_dump"
     }
     fn description(&self) -> &str {
-        "현재 폰 화면의 요소를 번호와 함께 읽는다(예: [3] \"메시지 입력\"). 누를 요소의 번호를 ui_tap 에 준다. 특정 앱을 읽으려면 package 를 준다(멀티윈도에서 정확)."
+        "Read numbered elements on the phone screen, e.g. [3] \"Send\". Pass the number to ui_tap."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "package": { "type": "string", "description": "읽을 앱 패키지명 (예: com.kakao.talk). 생략 시 최상위 앱 창." }
+                "package": { "type": "string", "description": "App package to read, e.g. com.kakao.talk" }
             }
         })
     }
@@ -171,13 +171,13 @@ impl Tool for AppOpen {
         "app_open"
     }
     fn description(&self) -> &str {
-        "패키지명으로 앱을 실행한다(예: com.kakao.talk). 실행 후 ui_dump 로 화면을 읽어라."
+        "Launch an app by package name, then read it with ui_dump."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "package": { "type": "string", "description": "앱 패키지명 (예: com.kakao.talk)" }
+                "package": { "type": "string", "description": "App package, e.g. com.kakao.talk" }
             },
             "required": ["package"]
         })
@@ -209,13 +209,13 @@ impl Tool for UiTap {
         "ui_tap"
     }
     fn description(&self) -> &str {
-        "ui_dump 로 얻은 요소 번호(index)를 눌러 버튼·입력창을 조작한다. 누른 뒤의 화면을 함께 돌려준다."
+        "Tap the element with this ui_dump index; returns the new screen."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "index": { "type": "integer", "description": "ui_dump 목록의 요소 번호(예: [3] 이면 3)" }
+                "index": { "type": "integer", "description": "Element number from ui_dump" }
             },
             "required": ["index"]
         })
@@ -223,13 +223,26 @@ impl Tool for UiTap {
     fn approval(&self) -> ApprovalClass {
         ApprovalClass::Mutating
     }
+    /// 번호만으로는 사람이 무엇을 누르는지 알 수 없다 — 캐시된 요소 텍스트를 함께 보인다.
+    fn approval_arguments(&self, args: &Value) -> Value {
+        let mut shown = args.clone();
+        let text = args
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| last().lock().unwrap().get(i).map(|e| e.text.clone()));
+        if let (Some(text), Some(object)) = (text, shown.as_object_mut()) {
+            object.insert("element".into(), json!(text));
+        }
+        shown
+    }
     fn run(&self, args: &Value) -> Result<String> {
         let index = args
             .get("index")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("index 는 정수여야 함(ui_dump 의 번호)"))?;
-        // 캐시에서 번호→좌표. 네트워크 전에 락을 풀어 I/O 동안 잠그지 않는다.
-        let (x, y) = {
+        // 캐시에서 번호→승인 때 보인 텍스트. 네트워크 전에 락을 풀어 I/O 동안 잠그지 않는다.
+        let (i, expected) = {
             let guard = last().lock().unwrap();
             if guard.is_empty() {
                 return Err(anyhow!("먼저 ui_dump 로 화면을 읽어 번호를 확인하라."));
@@ -241,7 +254,18 @@ impl Tool for UiTap {
                     guard.len() - 1
                 )
             })?;
-            (e.x, e.y)
+            (i, e.text.clone())
+        };
+        // 승인 사이 화면이 바뀌었으면(알림·스크롤) 같은 번호가 다른 버튼일 수 있다 —
+        // 탭 직전에 다시 읽어 텍스트가 같을 때만 그 최신 좌표를 누른다.
+        let fresh = parse_elems(&bridge_get("/screen")?);
+        let (x, y) = match fresh.get(i) {
+            Some(e) if e.text == expected => (e.x, e.y),
+            _ => {
+                return Err(anyhow!(
+                    "화면이 바뀜 — #{index} 가 더 이상 \"{expected}\" 가 아니다. ui_dump 로 다시 읽어라."
+                ))
+            }
         };
         let body = bridge_post("/tap", json!({ "x": x, "y": y }))?;
         expect_ok(&body, String::new(), "탭 실패")?;
@@ -259,13 +283,13 @@ impl Tool for UiTapText {
         "ui_tap_text"
     }
     fn description(&self) -> &str {
-        "화면에서 그 텍스트가 보이는 요소를 눌러(예: 이름·버튼 라벨). 번호를 몰라도 된다. 누른 뒤의 화면을 함께 돌려준다."
+        "Tap the element showing this text; returns the new screen."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "누를 요소에 보이는 텍스트(부분 일치)" }
+                "text": { "type": "string", "description": "Visible text (substring)" }
             },
             "required": ["text"]
         })
@@ -305,14 +329,14 @@ impl Tool for UiType {
         "ui_type"
     }
     fn description(&self) -> &str {
-        "현재 포커스된 입력창에 텍스트를 입력한다(한글 정상). 먼저 입력창을 눌러 포커스한 뒤 사용한다. 입력 뒤의 화면을 함께 돌려준다."
+        "Type text into the focused input (tap it first). Returns the new screen."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "text": { "type": "string", "description": "입력할 텍스트" },
-                "package": { "type": "string", "description": "이 앱의 포커스된 입력창에만 입력 (예: net.thunderbird.android)" }
+                "text": { "type": "string", "description": "Text to type" },
+                "package": { "type": "string", "description": "Only type into this app's focused input" }
             },
             "required": ["text"]
         })
@@ -346,7 +370,7 @@ impl Tool for UiBack {
         "ui_back"
     }
     fn description(&self) -> &str {
-        "뒤로가기(back)를 누른다. 화면을 이전으로 되돌린 뒤의 화면을 함께 돌려준다."
+        "Press back; returns the new screen."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })
@@ -371,12 +395,12 @@ impl Tool for UiScroll {
         "ui_scroll"
     }
     fn description(&self) -> &str {
-        "메일 목록·긴 본문·대화 화면을 위(up) 또는 아래(down)로 스크롤하고 새 화면을 읽는다. package를 주면 그 앱에서만 동작한다. 끝에 도달하면 반복하지 않는다."
+        "Scroll up or down and read the new screen. Stop when the end is reached."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {
             "direction": { "type": "string", "enum": ["down", "up"] },
-            "package": { "type": "string", "description": "스크롤할 앱 패키지명 (예: net.thunderbird.android)" }
+            "package": { "type": "string", "description": "App package to scroll" }
         }, "required": ["direction"] })
     }
     fn approval(&self) -> ApprovalClass {

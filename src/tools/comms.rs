@@ -25,14 +25,14 @@ impl Tool for SmsSend {
         "sms_send"
     }
     fn description(&self) -> &str {
-        "지정한 번호로 문자 메시지를 보낸다"
+        "Send an SMS to a phone number."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "number": { "type": "string", "description": "수신 전화번호" },
-                "text": { "type": "string", "description": "보낼 내용" }
+                "number": { "type": "string", "description": "Recipient phone number" },
+                "text": { "type": "string", "description": "Message text" }
             },
             "required": ["number", "text"]
         })
@@ -46,7 +46,10 @@ impl Tool for SmsSend {
         if !is_phone_number(number) {
             return Err(invalid_phone_number(number));
         }
-        termux::run("termux-sms-send", &["-n", number, text])?;
+        // termux-sms-send 는 번호를 따옴표 없이 펼치므로 공백·구분자를 걷어내고, 본문은
+        // stdin 으로 넘겨 '-' 로 시작하는 본문이 옵션으로 읽히거나 echo 가 해석하지 않게 한다.
+        let number = normalize_phone_number(number);
+        termux::run_with_stdin("termux-sms-send", &["-n", &number], text)?;
         Ok(format!("문자 발송 완료 → {number}"))
     }
 }
@@ -71,13 +74,20 @@ fn is_phone_number(s: &str) -> bool {
     digits >= 3 && ok_chars
 }
 
+/// 형식 검증을 통과한 번호에서 `+`·숫자만 남긴다.
+fn normalize_phone_number(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .collect()
+}
+
 pub struct Reminder;
 impl Tool for Reminder {
     fn name(&self) -> &str {
         "reminder"
     }
     fn description(&self) -> &str {
-        "지정한 분(minutes) 뒤에 알림으로 리마인드한다. '30분 뒤 약 먹으라고 알려줘' 같은 요청에 쓴다."
+        "Show a reminder notification after the given minutes."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -87,9 +97,9 @@ impl Tool for Reminder {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_REMINDER_MINUTES,
-                    "description": "몇 분 뒤에 알릴지 (최대 1년)"
+                    "description": "Minutes from now (max 1 year)"
                 },
-                "text": { "type": "string", "description": "알림 내용" }
+                "text": { "type": "string", "description": "Reminder text" }
             },
             "required": ["minutes", "text"]
         })
@@ -111,7 +121,7 @@ impl Tool for Reminder {
             .ok_or_else(|| anyhow!("리마인더 시간이 너무 큼"))?
             .to_string();
         // detached 백그라운드로 sleep 후 알림 — $1/$2 positional 로 넘겨 셸 인젝션 차단.
-        Command::new("sh")
+        let mut child = Command::new("sh")
             .args([
                 "-c",
                 "sleep \"$1\"; termux-notification --title 리마인더 --content \"$2\"",
@@ -124,6 +134,8 @@ impl Tool for Reminder {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| anyhow!("리마인더 예약 실패: {e}"))?;
+        // 오래 켜 둔 TUI 에 좀비가 쌓이지 않게 끝나면 회수한다.
+        std::thread::spawn(move || child.wait());
         Ok(format!("{minutes}분 뒤 알림 예약됨: {text}"))
     }
 }
@@ -134,13 +146,13 @@ impl Tool for Call {
         "call"
     }
     fn description(&self) -> &str {
-        "지정한 전화번호로 실제 전화를 건다. 사용자가 명시적으로 전화를 걸어달라고 할 때만 쓴다."
+        "Place a real phone call. Only when the user explicitly asks to call."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "number": { "type": "string", "description": "발신 전화번호(실제 숫자 번호)" }
+                "number": { "type": "string", "description": "Phone number (digits)" }
             },
             "required": ["number"]
         })
@@ -160,7 +172,7 @@ impl Tool for Call {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_phone_number, Call, Reminder, MAX_REMINDER_MINUTES};
+    use super::{is_phone_number, normalize_phone_number, Call, Reminder, MAX_REMINDER_MINUTES};
     use crate::ports::Tool;
 
     #[test]
@@ -171,6 +183,12 @@ mod tests {
         assert!(!is_phone_number("-01012345678"));
         assert!(is_phone_number("01012345678"));
         assert!(is_phone_number("+82 10-1234-5678"));
+    }
+
+    #[test]
+    fn normalized_number_is_a_single_shell_word() {
+        assert_eq!(normalize_phone_number("+82 10-1234-5678"), "+821012345678");
+        assert_eq!(normalize_phone_number("(02) 123-4567"), "021234567");
     }
 
     #[test]

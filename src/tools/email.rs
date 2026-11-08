@@ -37,11 +37,11 @@ impl Tool for EmailOpen {
         "email_open"
     }
     fn description(&self) -> &str {
-        "알림 없이 메일 앱을 연다. 기본은 Thunderbird. ui_dump(package=net.thunderbird.android)로 메일 목록을 읽고, 메일을 눌러 본문·답장을 확인한다."
+        "Open the mail app (default Thunderbird). Then read it with ui_dump(package=net.thunderbird.android)."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {
-            "package": { "type": "string", "description": "메일 앱 패키지명. 생략하면 net.thunderbird.android" }
+            "package": { "type": "string", "description": "Mail app package (default net.thunderbird.android)" }
         } })
     }
     fn approval(&self) -> ApprovalClass {
@@ -66,14 +66,14 @@ impl Tool for EmailCompose {
         "email_compose"
     }
     fn description(&self) -> &str {
-        "Thunderbird에 받는 사람·제목·본문을 채운 새 메일 작성 화면을 연다. 아직 발송되지 않는다. 기존 메일 답장은 email_open으로 원문을 열고 답장 버튼을 사용한다."
+        "Open a prefilled new-mail screen in Thunderbird. Does not send. To reply, open the mail with email_open and use its reply button."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {
-            "to": { "type": "string", "description": "받는 사람 이메일 주소 하나" },
-            "subject": { "type": "string", "description": "메일 제목" },
-            "body": { "type": "string", "description": "메일 본문" },
-            "package": { "type": "string", "description": "메일 앱 패키지명. 생략하면 net.thunderbird.android" }
+            "to": { "type": "string", "description": "One recipient email address" },
+            "subject": { "type": "string", "description": "Subject" },
+            "body": { "type": "string", "description": "Body" },
+            "package": { "type": "string", "description": "Mail app package (default net.thunderbird.android)" }
         }, "required": ["to"] })
     }
     fn approval(&self) -> ApprovalClass {

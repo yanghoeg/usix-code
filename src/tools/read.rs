@@ -28,7 +28,7 @@ impl Tool for SmsList {
         "sms_list"
     }
     fn description(&self) -> &str {
-        "최근 수신 문자 메시지를 조회한다"
+        "List recent received SMS messages."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -38,7 +38,7 @@ impl Tool for SmsList {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_SMS_MESSAGES,
-                    "description": "가져올 개수 (기본 10, 최대 15)"
+                    "description": "Count (default 10, max 15)"
                 }
             }
         })
@@ -75,7 +75,7 @@ impl Tool for CallLog {
         "call_log"
     }
     fn description(&self) -> &str {
-        "최근 통화 기록을 조회한다"
+        "List recent calls."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -85,7 +85,7 @@ impl Tool for CallLog {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_LOG_LIMIT,
-                    "description": "가져올 개수 (기본 10, 최대 100)"
+                    "description": "Count (default 10, max 100)"
                 }
             }
         })
@@ -105,13 +105,13 @@ impl Tool for Contacts {
         "contacts"
     }
     fn description(&self) -> &str {
-        "저장된 연락처(이름↔전화번호)를 조회한다. 이름으로 문자·전화할 때 번호를 찾는 데 쓴다."
+        "Look up saved contacts (name and number). Use it to find a number before texting or calling."
     }
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string", "description": "이름 일부로 거를 검색어 (생략 시 전체)" }
+                "name": { "type": "string", "description": "Part of a name to filter by" }
             }
         })
     }
@@ -160,7 +160,7 @@ impl Tool for Battery {
         "battery"
     }
     fn description(&self) -> &str {
-        "배터리 퍼센트(잔량)·온도·충전 상태를 조회한다. 배터리 관련 질문은 이 도구를 쓴다."
+        "Battery percentage, temperature, and charging state."
     }
     fn parameters(&self) -> Value {
         json!({ "type": "object", "properties": {} })

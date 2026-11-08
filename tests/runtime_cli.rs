@@ -28,12 +28,17 @@ impl Fixture {
     }
     fn command(&self) -> Command {
         let mut command = Command::new(BINARY);
+        // Isolate HOME so the developer's own ~/.usix skills never enter a test prompt.
+        // Fixture servers are foreign by design, so reuse is explicitly allowed here.
         command
+            .env("HOME", self.0.join("home"))
+            .env("USIX_REUSE_SERVER", "1")
             .env("USIX_TASKS_DIR", self.0.join("tasks"))
             .env_remove("USIX_BACKEND")
             .env_remove("USIX_MODEL")
-            .env_remove("USIX_CONTEXT_TOKENS")
-            .env_remove("USIX_OUTPUT_TOKENS");
+            // Pin the budget: the automatic default depends on the test machine's memory.
+            .env("USIX_CONTEXT_TOKENS", "8192")
+            .env("USIX_OUTPUT_TOKENS", "1024");
         command
     }
 }
@@ -138,6 +143,10 @@ fn worker_reads_creation_workspace_even_when_launched_elsewhere() {
         if path == "/health" {
             return ("application/json", json!({"status":"ok"}).to_string());
         }
+        if path == "/props" {
+            let props = json!({"default_generation_settings":{"n_ctx":8192}});
+            return ("application/json", props.to_string());
+        }
         assert_eq!(path, "/v1/chat/completions");
         assert_eq!(body["max_tokens"], 1024);
         let read = body["messages"]
@@ -183,6 +192,51 @@ fn worker_reads_creation_workspace_even_when_launched_elsewhere() {
     assert_eq!(task["status"], "completed");
     assert_eq!(task["last_result"], "CREATION_WORKSPACE");
     assert_eq!(task["workspace"], json!(a.canonicalize().unwrap()));
+}
+
+#[test]
+fn foreign_llama_server_is_refused_unless_reuse_is_explicit() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, _| match path {
+        "/health" => ("application/json", json!({"status":"ok"}).to_string()),
+        _ => panic!("an untrusted server must not receive inference: {path}"),
+    });
+    let output = fixture
+        .command()
+        .env_remove("USIX_REUSE_SERVER")
+        .env("USIX_LLAMA_PORT", server.port.to_string())
+        .args(["-c", "PRIVATE_PROMPT_456"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("USIX_REUSE_SERVER=1"));
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(path, _)| path == "/health"));
+}
+
+#[test]
+fn reused_llama_server_smaller_than_the_minimum_budget_is_rejected() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, _| match path {
+        "/health" => ("application/json", json!({"status":"ok"}).to_string()),
+        "/props" => (
+            "application/json",
+            json!({"default_generation_settings":{"n_ctx":1024}}).to_string(),
+        ),
+        _ => panic!("inference must not exceed the server window: {path}"),
+    });
+    let output = fixture
+        .command()
+        .env("USIX_LLAMA_PORT", server.port.to_string())
+        .args(["-c", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only holds 1024 tokens"));
 }
 
 #[test]
