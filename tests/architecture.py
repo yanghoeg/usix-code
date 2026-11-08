@@ -9,7 +9,7 @@ CORE = sorted((ROOT / "src/domain").glob("*.rs")) + [
 FORBIDDEN = re.compile(
     r"\bstd::(?:fs|env|process|thread|time|net|io)\b"
     r"|\bcrate::(?:adapters|tools|bootstrap|tui)\b"
-    r"|\b(?:ureq|libc|crossterm|ratatui|regex|usix_shellast)::"
+    r"|\b(?:ureq|libc|crossterm|ratatui|regex|usix_shellast|hmac|sha2)::"
     r"|\b(?:println|eprintln|print|eprint)!"
 )
 
