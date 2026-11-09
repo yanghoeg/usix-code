@@ -72,7 +72,7 @@ const PROOF_PREFIX: &str = "usix-companion-proof-v1:";
 /// `/proof` 응답 분류 — 판정은 순수 함수(`check_proof`)가 한다.
 enum ProofReply {
     Proof(String),
-    /// 증명을 모르는 구버전 앱(404).
+    /// 증명을 모르는 구버전 앱 — /proof 도 인증 뒤에 라우팅해 401, 또는 404.
     Unsupported,
     Invalid,
 }
@@ -124,7 +124,7 @@ fn verify_companion(token: &str) -> Result<()> {
             .ok()
             .and_then(|body| body["proof"].as_str().map(str::to_owned))
             .map_or(ProofReply::Invalid, ProofReply::Proof),
-        Err(ureq::Error::Status(404, _)) => ProofReply::Unsupported,
+        Err(ureq::Error::Status(401 | 404, _)) => ProofReply::Unsupported,
         Err(ureq::Error::Status(..)) => ProofReply::Invalid,
         Err(e) => return Err(bridge_err(e)),
     };
