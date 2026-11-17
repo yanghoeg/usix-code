@@ -1,4 +1,4 @@
-// ADAPTER — 로컬 llama.cpp llama-server 의 OpenAI 호환 /v1/chat/completions.
+// ADAPTER — 로컬 llama.cpp llama-server(또는 같은 API 의 Strata)의 OpenAI 호환 /v1/chat/completions.
 // jinja 템플릿이 기본 켜져 있어(Qwen2.5) tools 배열을 넣으면 tool_calls 로 돌려준다.
 // 동기 HTTP(ureq), TLS 없음. 모델 로드는 서버 기동 시 결정되므로 여기선 model 필드 불필요.
 use crate::domain::context::Budget;
@@ -10,6 +10,10 @@ use std::io::BufRead;
 pub struct LlamaCpp {
     url: String,
     budget: Budget,
+    api_key: Option<String>,
+    /// 오류 메시지용 서버 이름과 복구 안내.
+    server: &'static str,
+    hint: &'static str,
 }
 
 impl LlamaCpp {
@@ -17,7 +21,30 @@ impl LlamaCpp {
         Self {
             url: format!("http://127.0.0.1:{port}/v1/chat/completions"),
             budget,
+            api_key: None,
+            server: "llama-server",
+            hint: "서버 실행 중? usix-code setup",
         }
+    }
+
+    /// Strata 는 llama.cpp 호환 엔드포인트를 그대로 제공한다. 키가 설정된 서버는 Bearer 로 받는다.
+    pub fn strata(budget: Budget, port: u16, api_key: Option<String>) -> Self {
+        Self {
+            api_key,
+            server: "Strata",
+            hint: "strata launch --no-tui 로 서버를 먼저 띄웠는지 확인",
+            ..Self::new(budget, port)
+        }
+    }
+
+    fn post(&self, body: Value) -> Result<ureq::Response> {
+        let mut request = super::http_agent().post(&self.url);
+        if let Some(key) = &self.api_key {
+            request = request.set("Authorization", &format!("Bearer {key}"));
+        }
+        request
+            .send_json(body)
+            .map_err(|e| anyhow!("{} 요청 실패 ({}): {e}", self.server, self.hint))
     }
 }
 
@@ -39,12 +66,10 @@ impl Llm for LlamaCpp {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
-        let resp: Value = super::http_agent()
-            .post(&self.url)
-            .send_json(body)
-            .map_err(|e| anyhow!("llama-server 요청 실패 (서버 실행 중? usix-code setup): {e}"))?
+        let resp: Value = self
+            .post(body)?
             .into_json()
-            .map_err(|e| anyhow!("llama-server 응답 파싱 실패: {e}"))?;
+            .map_err(|e| anyhow!("{} 응답 파싱 실패: {e}", self.server))?;
         // OpenAI 스키마: choices[0].message (tool_calls 는 function.arguments 가 JSON 문자열).
         let msg = resp
             .get("choices")
@@ -74,10 +99,7 @@ impl Llm for LlamaCpp {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
-        let resp = super::http_agent()
-            .post(&self.url)
-            .send_json(body)
-            .map_err(|e| anyhow!("llama-server 요청 실패 (서버 실행 중? usix-code setup): {e}"))?;
+        let resp = self.post(body)?;
         let reader = std::io::BufReader::new(resp.into_reader());
 
         let mut content = String::new();

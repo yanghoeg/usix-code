@@ -10,6 +10,8 @@ use crate::domain::tasks::Task;
 pub enum Backend {
     Llama,
     Ollama,
+    /// An external Strata server; the harness attaches to it and never launches it.
+    Strata,
 }
 
 impl Backend {
@@ -17,6 +19,7 @@ impl Backend {
         match self {
             Self::Llama => "llama",
             Self::Ollama => "ollama",
+            Self::Strata => "strata",
         }
     }
 }

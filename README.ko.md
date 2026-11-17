@@ -87,6 +87,24 @@ usix-code setup
 usix-code
 ```
 
+이미 실행 중인 [Strata](https://github.com/Niko1221/Strata) 서버에 연결할 수도 있습니다.
+Strata는 NVIDIA·AMD GPU가 있는 x86-64 Linux용이며 Termux에서는 실행되지 않습니다.
+
+```sh
+strata launch --no-tui    # 설치·모델 다운로드·엔진 실행은 Strata가 담당
+export USIX_BACKEND=strata
+usix-code doctor
+usix-code
+```
+
+하네스는 Strata를 설치하거나 시작하지 않습니다. `USIX_BACKEND=strata`를 고른 것이 외부
+서버를 쓰겠다는 명시적 선택이므로 `USIX_REUSE_SERVER`는 필요 없습니다. 대신 대화 내용을
+보내기 전에 `/health`가 `"service": "strata"`를 보고해야 하며, 예산은 서버의 `max_context`에
+맞춰 줄입니다. `USIX_STRATA_PORT`로 8080 포트를 바꿀 수 있고, 서버가 키를 요구하면
+`STRATA_API_KEY`를 bearer 토큰으로 보냅니다. 요청은 `chat_template_kwargs`로 thinking을
+끕니다. Strata는 모델 파일을 보고 엔진을 고르므로, 외부 GGUF는 쓰기 전에
+`strata models import <file.gguf> --plan`으로 확인하세요.
+
 하네스가 시작하는 Ollama에는 `OLLAMA_NO_CLOUD=1`을 설정합니다. 추론할 때마다
 `/api/show`의 로컬 GGUF 메타데이터를 확인합니다. 기존 서버를 사용하는 경우에도
 원격 모델 별칭이나 로컬 여부를 확인할 수 없는 모델은 대화 내용을 보내기 전에 거부합니다.

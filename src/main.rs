@@ -53,27 +53,33 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// LLM 백엔드 선택 — 기본 llama.cpp, USIX_BACKEND=ollama 로 전환.
+// LLM 백엔드 선택 — 기본 llama.cpp, USIX_BACKEND=ollama|strata 로 전환.
 fn backend() -> anyhow::Result<Box<dyn Llm>> {
     let budget = bootstrap::context_budget()?;
-    if bootstrap::backend()? == Backend::Ollama {
-        Ok(Box::new(Ollama::new(
+    Ok(match bootstrap::backend()? {
+        Backend::Ollama => Box::new(Ollama::new(
             bootstrap::ollama_model(),
             budget,
             adapters::ollama_port()?,
-        )))
-    } else {
-        Ok(Box::new(LlamaCpp::new(
+        )),
+        Backend::Llama => Box::new(LlamaCpp::new(
             bootstrap::served_budget(budget)?,
             adapters::llama_port()?,
-        )))
-    }
+        )),
+        Backend::Strata => Box::new(LlamaCpp::strata(
+            bootstrap::strata_budget(budget)?,
+            adapters::strata_port()?,
+            adapters::strata::api_key(),
+        )),
+    })
 }
 
 // 현재 백엔드/모델을 짧게 라벨링 — TUI 하단·배너 표기용.
 fn model_label() -> String {
     if matches!(bootstrap::backend(), Ok(Backend::Ollama)) {
         bootstrap::ollama_model()
+    } else if matches!(bootstrap::backend(), Ok(Backend::Strata)) {
+        bootstrap::strata_model().unwrap_or_else(|| "strata".into())
     } else {
         let path = bootstrap::llama_model_path();
         std::path::Path::new(&path)
@@ -124,8 +130,9 @@ fn print_help() {
          usix-code task --help  durable tasks and schedules\n  \
          usix-code worker       process due tasks; pause for approvals\n\n\
          Environment:\n  \
-         USIX_BACKEND  llama (default) | ollama\n  \
+         USIX_BACKEND  llama (default) | ollama | strata (attach to a running Strata server)\n  \
          USIX_MODEL    llama=GGUF path (default ~/models/Qwen3.5-2B-Q5_K_M.gguf)\n                \
-         ollama=model tag (default qwen2.5:1.5b-instruct-q5_K_M)"
+         ollama=model tag (default qwen2.5:1.5b-instruct-q5_K_M)\n  \
+         STRATA_API_KEY  key for a Strata server that requires one"
     );
 }

@@ -23,11 +23,13 @@ impl Host for Linux {
     }
 
     fn ensure_backend(&self, backend: Backend) -> Result<()> {
-        if has_cmd(match backend {
+        let command = match backend {
             Backend::Llama => "llama-server",
             Backend::Ollama => "ollama",
-        }) || (backend == Backend::Llama && managed_llama().is_file())
-        {
+            // Strata ships its own installer and GPU engine; setup only attaches to it.
+            Backend::Strata => return Ok(()),
+        };
+        if has_cmd(command) || (backend == Backend::Llama && managed_llama().is_file()) {
             return Ok(());
         }
         install(include_str!("../../../scripts/backends/linux.sh"), backend)
@@ -38,6 +40,7 @@ impl Host for Linux {
             Backend::Llama if !has_cmd("llama-server") => LaunchSpec::new(managed_llama()),
             Backend::Llama => LaunchSpec::new("llama-server"),
             Backend::Ollama => LaunchSpec::new("ollama"),
+            Backend::Strata => LaunchSpec::new("strata"),
         }
     }
 

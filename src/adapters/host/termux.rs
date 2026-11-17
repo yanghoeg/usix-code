@@ -62,6 +62,9 @@ impl Host for Termux {
         if has_cmd(match backend {
             Backend::Llama => "llama-server",
             Backend::Ollama => "ollama",
+            Backend::Strata => anyhow::bail!(
+                "Strata needs an x86-64 Linux, Windows or Apple Silicon GPU host; use USIX_BACKEND=llama on Termux"
+            ),
         }) {
             return Ok(());
         }
@@ -78,6 +81,7 @@ impl Host for Termux {
             }
             Backend::Llama => LaunchSpec::new("llama-server"),
             Backend::Ollama => LaunchSpec::new("ollama"),
+            Backend::Strata => LaunchSpec::new("strata"),
         }
     }
 

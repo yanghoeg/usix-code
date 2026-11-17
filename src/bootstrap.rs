@@ -2,7 +2,7 @@
 use crate::adapters::{
     host::{has_cmd, state_dir, total_memory},
     runtime::{self, OwnedServer},
-    skills,
+    skills, strata,
 };
 use crate::domain::context::{default_output, Budget};
 use crate::ports::{Backend, Host};
@@ -47,7 +47,8 @@ pub fn backend() -> Result<Backend> {
     match std::env::var("USIX_BACKEND").as_deref().unwrap_or("llama") {
         "llama" => Ok(Backend::Llama),
         "ollama" => Ok(Backend::Ollama),
-        other => bail!("unknown USIX_BACKEND `{other}`; use llama or ollama"),
+        "strata" => Ok(Backend::Strata),
+        other => bail!("unknown USIX_BACKEND `{other}`; use llama, ollama or strata"),
     }
 }
 
@@ -89,7 +90,31 @@ fn server_up(backend: Backend) -> bool {
             .ok()
             .and_then(|port| probe(&format!("http://127.0.0.1:{port}/health")))
             .is_some_and(|body| body["status"] == "ok"),
+        Backend::Strata => strata_health().is_some(),
     }
+}
+
+fn strata_health() -> Option<strata::Health> {
+    let port = crate::adapters::strata_port().ok()?;
+    strata::parse_health(&probe(&format!("http://127.0.0.1:{port}/health"))?)
+}
+
+/// Strata is installed and started by its own tools; the harness only attaches.
+/// Selecting USIX_BACKEND=strata is the explicit trust decision that
+/// USIX_REUSE_SERVER=1 makes for other backends, so the server must name itself.
+fn attach_strata() -> Result<strata::Health> {
+    let port = crate::adapters::strata_port()?;
+    let body = probe(&format!("http://127.0.0.1:{port}/health")).with_context(|| {
+        format!("no Strata server answers on 127.0.0.1:{port}; start it with `strata launch --no-tui`, or set USIX_STRATA_PORT")
+    })?;
+    let health = strata::parse_health(&body).with_context(|| {
+        format!("the server on 127.0.0.1:{port} is not Strata; inference was not sent")
+    })?;
+    ensure!(
+        !health.needs_key || strata::api_key().is_some(),
+        "the Strata server requires an API key; set STRATA_API_KEY"
+    );
+    Ok(health)
 }
 
 /// Loopback is shared by every app on the device, so a listening port proves nothing.
@@ -118,11 +143,29 @@ pub fn served_budget(budget: Budget) -> Result<Budget> {
         .and_then(|port| probe(&format!("http://127.0.0.1:{port}/props")))
         .and_then(|body| body["default_generation_settings"]["n_ctx"].as_u64())
         .and_then(|n| usize::try_from(n).ok());
+    fit_window(budget, served, "llama-server")
+}
+
+/// Strata refuses requests longer than its window; `/health` reports it without a key.
+pub fn strata_budget(budget: Budget) -> Result<Budget> {
+    fit_window(
+        budget,
+        strata_health().and_then(|h| h.max_context),
+        "Strata server",
+    )
+}
+
+fn fit_window(budget: Budget, served: Option<usize>, server: &str) -> Result<Budget> {
     match served {
         Some(n) if n < budget.context_tokens => Budget::new(n, budget.output_tokens.min(n / 2))
-            .with_context(|| format!("the running llama-server only holds {n} tokens per request")),
+            .with_context(|| format!("the running {server} only holds {n} tokens per request")),
         _ => Ok(budget),
     }
+}
+
+/// The served model's name for the TUI label.
+pub fn strata_model() -> Option<String> {
+    strata_health().map(|h| h.model)
 }
 
 fn reuse_allowed() -> bool {
@@ -219,10 +262,17 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
     if backend == Backend::Ollama {
         crate::adapters::ollama::validate_model_name(&ollama_model())?;
     }
+    if backend == Backend::Strata {
+        attach_strata()?;
+        // Fail before any conversation data if the window cannot hold a request.
+        strata_budget(context_budget()?)?;
+        return Ok(None);
+    }
     if server_up(backend) {
         let port = match backend {
             Backend::Llama => crate::adapters::llama_port()?,
             Backend::Ollama => crate::adapters::ollama_port()?,
+            Backend::Strata => crate::adapters::strata_port()?,
         };
         ensure!(
             reuse_allowed(),
@@ -262,6 +312,7 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
             ]);
             240
         }
+        Backend::Strata => bail!("usix-code never launches Strata"),
     };
     let log = log_path(backend);
     println!(
@@ -280,7 +331,7 @@ fn ensure_backend_serve(host: &dyn Host) -> Result<Option<Child>> {
         }
         let ready = match backend {
             Backend::Llama => serves_alias(&alias),
-            Backend::Ollama => server_up(backend),
+            Backend::Ollama | Backend::Strata => server_up(backend),
         };
         if ready {
             return Ok(owned.0.take());
@@ -370,6 +421,18 @@ pub fn doctor(host: &dyn Host) -> Result<()> {
             mark(has_model(&ollama_model()).unwrap_or(false)),
             ollama_model()
         ),
+        Backend::Strata => match strata_health() {
+            Some(health) => println!(
+                "{} model: {} (window {}, API key {})",
+                mark(!health.needs_key || strata::api_key().is_some()),
+                health.model,
+                health
+                    .max_context
+                    .map_or("unknown".into(), |n| n.to_string()),
+                if health.needs_key { "required" } else { "off" }
+            ),
+            None => println!("❌ model: no Strata server; start it with `strata launch --no-tui`"),
+        },
     }
     let budget = context_budget()?;
     let source = if std::env::var_os("USIX_CONTEXT_TOKENS").is_some() {

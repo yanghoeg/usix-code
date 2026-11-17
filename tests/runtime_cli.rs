@@ -36,6 +36,8 @@ impl Fixture {
             .env("USIX_TASKS_DIR", self.0.join("tasks"))
             .env_remove("USIX_BACKEND")
             .env_remove("USIX_MODEL")
+            .env_remove("USIX_STRATA_PORT")
+            .env_remove("STRATA_API_KEY")
             // Pin the budget: the automatic default depends on the test machine's memory.
             .env("USIX_CONTEXT_TOKENS", "8192")
             .env("USIX_OUTPUT_TOKENS", "1024");
@@ -48,7 +50,8 @@ impl Drop for Fixture {
     }
 }
 
-type Requests = Arc<Mutex<Vec<(String, Value)>>>;
+/// Path, Authorization header and JSON body of each request a fixture server saw.
+type Requests = Arc<Mutex<Vec<(String, Option<String>, Value)>>>;
 struct Server {
     port: u16,
     requests: Requests,
@@ -70,8 +73,11 @@ impl Server {
             while !stopped.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        if let Some((path, body)) = read_request(&stream) {
-                            captured.lock().unwrap().push((path.clone(), body.clone()));
+                        if let Some((path, auth, body)) = read_request(&stream) {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push((path.clone(), auth, body.clone()));
                             let (kind, body) = respond(&path, &body);
                             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                         }
@@ -98,7 +104,7 @@ impl Drop for Server {
     }
 }
 
-fn read_request(stream: &TcpStream) -> Option<(String, Value)> {
+fn read_request(stream: &TcpStream) -> Option<(String, Option<String>, Value)> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -107,6 +113,7 @@ fn read_request(stream: &TcpStream) -> Option<(String, Value)> {
     reader.read_line(&mut line).ok()?;
     let path = line.split_whitespace().nth(1)?.to_owned();
     let mut length = 0;
+    let mut auth = None;
     loop {
         line.clear();
         reader.read_line(&mut line).ok()?;
@@ -116,10 +123,17 @@ fn read_request(stream: &TcpStream) -> Option<(String, Value)> {
         if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
             length = value.trim().parse().ok()?;
         }
+        if line.to_ascii_lowercase().starts_with("authorization:") {
+            auth = Some(line["authorization:".len()..].trim().to_owned());
+        }
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).ok()?;
-    Some((path, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    Some((
+        path,
+        auth,
+        serde_json::from_slice(&body).unwrap_or(Value::Null),
+    ))
 }
 
 #[test]
@@ -215,7 +229,7 @@ fn foreign_llama_server_is_refused_unless_reuse_is_explicit() {
         .lock()
         .unwrap()
         .iter()
-        .all(|(path, _)| path == "/health"));
+        .all(|(path, _, _)| path == "/health"));
 }
 
 #[test]
@@ -260,9 +274,10 @@ fn remote_ollama_alias_never_receives_conversation_data() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("remote Ollama models are disabled"));
     let requests = server.requests.lock().unwrap();
-    assert!(requests.iter().all(
-        |(path, body)| path != "/api/chat" && !body.to_string().contains("PRIVATE_PROMPT_123")
-    ));
+    assert!(requests
+        .iter()
+        .all(|(path, _, body)| path != "/api/chat"
+            && !body.to_string().contains("PRIVATE_PROMPT_123")));
 }
 
 #[test]
@@ -293,6 +308,123 @@ fn verified_local_ollama_receives_explicit_context_and_output_limits() {
         String::from_utf8_lossy(&output.stdout).trim(),
         "local answer"
     );
+}
+
+fn strata_health(max_context: u64, api_key: bool) -> String {
+    json!({"status":"ok","service":"strata","model":"qwen36-fixture","max_context":max_context,
+        "loaded":true,"api_key":api_key})
+    .to_string()
+}
+
+fn strata_command(fixture: &Fixture, port: u16) -> Command {
+    // Strata is always an external server: choosing the backend is the trust decision.
+    let mut command = fixture.command();
+    command
+        .env_remove("USIX_REUSE_SERVER")
+        .env("USIX_BACKEND", "strata")
+        .env("USIX_STRATA_PORT", port.to_string());
+    command
+}
+
+#[test]
+fn strata_backend_attaches_with_its_api_key_and_thinking_off() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, body| match path {
+        "/health" => ("application/json", strata_health(8192, true)),
+        "/v1/chat/completions" => {
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+            assert_eq!(body["max_tokens"], 1024);
+            let chunk = json!({"choices":[{"delta":{"content":"strata answer"}}]});
+            (
+                "text/event-stream",
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+        }
+        _ => panic!("Strata exposes everything the harness needs through /health: {path}"),
+    });
+    let output = strata_command(&fixture, server.port)
+        .env("STRATA_API_KEY", "fixture-key")
+        .args(["-c", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "strata answer"
+    );
+    let requests = server.requests.lock().unwrap();
+    let chat = requests
+        .iter()
+        .find(|(path, _, _)| path == "/v1/chat/completions")
+        .expect("inference request");
+    assert_eq!(chat.1.as_deref(), Some("Bearer fixture-key"));
+}
+
+#[test]
+fn strata_backend_refuses_a_server_that_is_not_strata() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, _| match path {
+        "/health" => ("application/json", json!({"status":"ok"}).to_string()),
+        _ => panic!("a server that is not Strata must not receive inference: {path}"),
+    });
+    let output = strata_command(&fixture, server.port)
+        .args(["-c", "PRIVATE_PROMPT_789"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not Strata"));
+    let requests = server.requests.lock().unwrap();
+    assert!(requests.iter().all(|(path, _, _)| path == "/health"));
+}
+
+#[test]
+fn strata_backend_requires_the_key_the_server_demands() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, _| match path {
+        "/health" => ("application/json", strata_health(8192, true)),
+        _ => panic!("inference without the API key must not be attempted: {path}"),
+    });
+    let output = strata_command(&fixture, server.port)
+        .args(["-c", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("STRATA_API_KEY"));
+}
+
+#[test]
+fn strata_backend_window_smaller_than_the_minimum_budget_is_rejected() {
+    let fixture = Fixture::new();
+    let server = Server::start(|path, _| match path {
+        "/health" => ("application/json", strata_health(1024, false)),
+        _ => panic!("inference must not exceed the server window: {path}"),
+    });
+    let output = strata_command(&fixture, server.port)
+        .args(["-c", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only holds 1024 tokens"));
+}
+
+#[test]
+fn strata_backend_without_a_server_explains_how_to_start_it() {
+    let fixture = Fixture::new();
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let output = strata_command(&fixture, port)
+        .args(["-c", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("strata launch"));
 }
 
 fn wait_for_file(path: &std::path::Path) -> u32 {

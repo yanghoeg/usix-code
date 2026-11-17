@@ -4,6 +4,7 @@ pub mod llama;
 pub mod ollama;
 pub mod runtime;
 pub mod skills;
+pub mod strata;
 pub mod task_store;
 pub mod termux;
 pub mod workspace;
@@ -28,6 +29,10 @@ pub fn llama_port() -> anyhow::Result<u16> {
 }
 pub fn ollama_port() -> anyhow::Result<u16> {
     port("USIX_OLLAMA_PORT", 11434)
+}
+/// Strata's default server address is also 127.0.0.1:8080.
+pub fn strata_port() -> anyhow::Result<u16> {
+    port("USIX_STRATA_PORT", 8080)
 }
 
 /// LLM 백엔드용 HTTP 에이전트 — 타임아웃 필수. 서버가 연결만 받고 침묵하면 워커 스레드가

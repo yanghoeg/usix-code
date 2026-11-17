@@ -96,6 +96,25 @@ the model's local GGUF metadata through `/api/show`. Remote aliases and unverifi
 models are rejected before sending conversation data, including on an existing
 server. See Ollama's [API response fields](https://github.com/ollama/ollama/blob/main/api/types.go).
 
+To attach to a running [Strata](https://github.com/Niko1221/Strata) server
+(x86-64 Linux with an NVIDIA or AMD GPU; Strata does not run on Termux):
+
+```sh
+strata launch --no-tui    # Strata's own installer, model download, and engine
+export USIX_BACKEND=strata
+usix-code doctor
+usix-code
+```
+
+The harness never installs or starts Strata. Selecting `USIX_BACKEND=strata` is the
+explicit decision to use that external server, so `USIX_REUSE_SERVER` is not needed,
+but `/health` must report `"service": "strata"` before any conversation data is sent.
+The budget shrinks to the server's `max_context`. `USIX_STRATA_PORT` overrides port
+8080, and `STRATA_API_KEY` is sent as a bearer token when the server requires a key.
+Requests turn thinking off through `chat_template_kwargs`. Strata chooses its engine
+from the model file; check a third-party GGUF with
+`strata models import <file.gguf> --plan` before adopting it.
+
 llama.cpp uses `127.0.0.1:8080` and Ollama uses `127.0.0.1:11434`.
 `USIX_LLAMA_PORT` and `USIX_OLLAMA_PORT` override those ports; the address stays
 loopback-only. Model HTTP requests do not follow redirects.
